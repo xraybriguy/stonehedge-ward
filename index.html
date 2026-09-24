@@ -753,10 +753,30 @@ async function extractPdfLines(file){
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
   const lines = [];
+  let columnCutoffX = null; // x-boundary between the "Name" column and the "Household Members/Gender/Age" column
+
   for(let pageNum = 1; pageNum <= pdf.numPages; pageNum++){
     const page = await pdf.getPage(pageNum);
     const content = await page.getTextContent();
-    const items = content.items.map(i => ({ x: i.transform[4], y: i.transform[5], text: i.str })).filter(i => i.text.trim());
+    let items = content.items.map(i => ({ x: i.transform[4], y: i.transform[5], text: i.str })).filter(i => i.text.trim());
+
+    // This PDF is a two-column table: household name/phone/address sits in
+    // the left column, and each individual member's name/gender/age sits
+    // in a right column at the SAME row heights. Reading straight across
+    // both columns mashes unrelated text together. We only need the
+    // household-level info, so detect the column boundary from the
+    // repeated header row and drop everything to the right of it.
+    if(columnCutoffX === null){
+      const nameHeader = items.find(i => i.text.trim() === 'Name');
+      const membersHeader = items.find(i => i.text.trim().includes('Household'));
+      if(nameHeader && membersHeader && membersHeader.x > nameHeader.x){
+        columnCutoffX = (nameHeader.x + membersHeader.x) / 2;
+      }
+    }
+    if(columnCutoffX !== null){
+      items = items.filter(i => i.x < columnCutoffX);
+    }
+
     items.sort((a,b) => b.y - a.y || a.x - b.x);
     let currentLine = [], currentY = null;
     const flush = () => {
