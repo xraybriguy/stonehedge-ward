@@ -274,7 +274,7 @@
         <div class="legend-row"><span class="dot" style="background:#D9731C"></span> 6 months – 1 year since contact</div>
         <div class="legend-row"><span class="dot" style="background:#B3402E"></span> Over 1 year / never</div>
         <div class="legend-row"><span class="dot" style="background:#8C8479"></span> Do not contact</div>
-        <p class="hint" style="margin-top:12px;">The small center dot shows contact status. The larger outer dot shows which zone the household is in — see the Calling tab for zone colors.</p>
+        <p class="hint" style="margin-top:12px;">The small center dot shows contact status. The larger outer dot shows which zone the household is in — see the Calling tab for zone colors. If you're WTFHL or Bishop, you can drag any pin to correct its position.</p>
       </div>
 
       <div id="household-detail">
@@ -563,33 +563,48 @@ function initMap(){
 }
 
 function renderMarkers(){
-  Object.values(markers).forEach(pair => pair.forEach(m => map.removeLayer(m)));
+  Object.values(markers).forEach(m => map.removeLayer(m));
   markers = {};
   const bounds = [];
   // Do-not-contact households never get a map dot at all, for every role —
   // that status lives in the Calling tab (Bishop's checklist / consultant's
   // own list) instead.
   const hideDNC = true;
+  const canDrag = ['wtfhl','bishop'].includes(myProfile.role);
 
   households.forEach(h => {
     if(hideDNC && h.do_not_contact) return;
 
     const outerColor = zoneColorFor(h);
     const innerColor = statusColor(contactStatus(h));
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="position:relative;width:24px;height:24px;">
+        <div style="position:absolute;inset:0;border-radius:50%;background:${outerColor};border:1.5px solid rgba(0,0,0,0.35);box-shadow:0 1px 3px rgba(0,0,0,0.25);"></div>
+        <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:${innerColor};border:1.5px solid #fff;"></div>
+      </div>`,
+      iconSize: [24, 24],
+      iconAnchor: [12, 12]
+    });
 
-    const outer = L.circleMarker([h.lat, h.lng], {
-      radius: 12, color: 'rgba(0,0,0,0.35)', weight: 1.5, fillColor: outerColor, fillOpacity: 1
-    }).addTo(map);
-    const inner = L.circleMarker([h.lat, h.lng], {
-      radius: 5, color: '#fff', weight: 1.5, fillColor: innerColor, fillOpacity: 1
-    }).addTo(map);
+    const marker = L.marker([h.lat, h.lng], { icon, draggable: canDrag }).addTo(map);
+    marker.on('click', () => selectHousehold(h.id));
+    marker.bindTooltip(h.household_name, { direction: 'top' });
 
-    const onClick = () => selectHousehold(h.id);
-    outer.on('click', onClick);
-    inner.on('click', onClick);
-    outer.bindTooltip(h.household_name, { direction: 'top' });
+    if(canDrag){
+      marker.on('dragend', async (e) => {
+        const { lat, lng } = e.target.getLatLng();
+        const { error } = await sb.from('households').update({ lat, lng }).eq('id', h.id);
+        if(error){
+          alert('Could not save the new location: ' + error.message);
+          e.target.setLatLng([h.lat, h.lng]); // snap back
+          return;
+        }
+        h.lat = lat; h.lng = lng;
+      });
+    }
 
-    markers[h.id] = [outer, inner];
+    markers[h.id] = marker;
     bounds.push([h.lat, h.lng]);
   });
 
@@ -1330,7 +1345,11 @@ function zoneAssignSectionHTML(){
     return `<div class="zone-item">
       <div class="zc"><span class="dot" style="background:${z.color}"></span> ${z.label} (${count} households)</div>
       <select class="zone-consultant-select" data-zone="${z.id}">${options}</select>
-      <button class="btn-secondary print-sheet-btn" data-zone="${z.id}" style="margin-top:2px;" ${count ? '' : 'disabled'}>Print info sheet (PDF)</button>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="btn-secondary print-sheet-btn" data-zone="${z.id}" style="margin-top:2px;" ${count ? '' : 'disabled'}>Print info sheet (PDF)</button>
+        <button class="btn-secondary toggle-household-list-btn" data-zone="${z.id}" style="margin-top:2px;background:#fff;color:var(--sage);border:1.5px solid var(--sage);" ${count ? '' : 'disabled'}>Edit households in this zone</button>
+      </div>
+      <div class="zone-household-list" data-zone="${z.id}" style="display:none;margin-top:8px;"></div>
     </div>`;
   }).join('') : '<p class="hint">No zones yet — split households below to create them.</p>';
 
@@ -1344,7 +1363,7 @@ function zoneAssignSectionHTML(){
       <input type="number" id="zone-count" min="1" max="30" value="7">
       <button class="btn-secondary" id="split-btn">Split into zones</button>
     </div>
-    <p class="hint" style="margin-top:12px;">To move one household to a different zone: go to the Map tab, click its pin, then use "Move to zone" there.</p>
+    <p class="hint" style="margin-top:12px;">Click "Edit households in this zone" below to see and reassign individual households, or drag any pin on the Map tab to move it.</p>
     <div class="zone-list">${zoneRows}</div>
     ${noConsultantsNote}
     <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--line);">
@@ -1448,6 +1467,40 @@ function wireZoneAssignSection(){
       } finally {
         btn.disabled = false; btn.textContent = 'Print info sheet (PDF)';
       }
+    });
+  });
+
+  document.querySelectorAll('.toggle-household-list-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const zoneId = btn.dataset.zone;
+      const listEl = document.querySelector(`.zone-household-list[data-zone="${zoneId}"]`);
+      const isOpen = listEl.style.display !== 'none';
+      if(isOpen){
+        listEl.style.display = 'none';
+        btn.textContent = 'Edit households in this zone';
+        return;
+      }
+      const inThisZone = households.filter(h => h.zone_id === zoneId).sort((a,b) => a.household_name.localeCompare(b.household_name));
+      const zoneOptions = zones.map(z => `<option value="${z.id}">${z.label}</option>`).join('');
+      listEl.innerHTML = inThisZone.map(h => `<div class="nc-row">
+        <div class="who"><strong>${escapeHtml(h.household_name)}</strong><div class="addr">${escapeHtml(h.address)}</div></div>
+        <select class="household-move-select" data-household="${h.id}" style="padding:6px 8px;border:1.5px solid var(--line);border-radius:7px;font-size:13px;">
+          ${zoneOptions.replace(`value="${zoneId}"`, `value="${zoneId}" selected`)}
+        </select>
+      </div>`).join('') || '<p class="hint">No households in this zone.</p>';
+      listEl.style.display = 'block';
+      btn.textContent = 'Hide household list';
+
+      listEl.querySelectorAll('.household-move-select').forEach(sel => {
+        sel.addEventListener('change', async () => {
+          const householdId = sel.dataset.household;
+          const newZoneId = sel.value;
+          const { error } = await sb.from('households').update({ zone_id: newZoneId }).eq('id', householdId);
+          if(error){ alert('Could not move household: ' + error.message); return; }
+          await loadHouseholds();
+          renderCallingTab();
+        });
+      });
     });
   });
 }
