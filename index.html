@@ -293,6 +293,7 @@
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script>
 /* ---------------- Supabase setup ---------------- */
 const SUPABASE_URL = "https://kqedpwqydpzqdywvqpjw.supabase.co";
@@ -308,6 +309,8 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     autoRefreshToken: true
   }
 });
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 /* ---------------- State ---------------- */
 let currentUser = null;
@@ -526,7 +529,7 @@ async function loadZones(){
 }
 
 async function loadHouseholds(){
-  const { data, error } = await sb.from('households').select('*').order('household_name');
+  const { data, error } = await sb.from('households').select('*').eq('active', true).order('household_name');
   if(error){ console.error(error); return; }
   households = data || [];
   renderMarkers();
@@ -745,6 +748,194 @@ function clusterHouseholds(points, k){
   return assign;
 }
 
+/* ---------------- Roster PDF parsing + diffing ---------------- */
+async function extractPdfLines(file){
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const lines = [];
+  for(let pageNum = 1; pageNum <= pdf.numPages; pageNum++){
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    const items = content.items.map(i => ({ x: i.transform[4], y: i.transform[5], text: i.str })).filter(i => i.text.trim());
+    items.sort((a,b) => b.y - a.y || a.x - b.x);
+    let currentLine = [], currentY = null;
+    const flush = () => {
+      if(currentLine.length){
+        currentLine.sort((a,b) => a.x - b.x);
+        const text = currentLine.map(i => i.text).join(' ').replace(/\s+/g,' ').trim();
+        if(text) lines.push(text);
+      }
+      currentLine = [];
+    };
+    items.forEach(item => {
+      if(currentY === null || Math.abs(item.y - currentY) < 3){
+        currentLine.push(item);
+        currentY = currentY === null ? item.y : currentY;
+      } else {
+        flush();
+        currentLine = [item];
+        currentY = item.y;
+      }
+    });
+    flush();
+  }
+  return lines;
+}
+
+// Best-effort reconstruction of household records from raw extracted PDF
+// lines. This is a heuristic, not a guaranteed-exact parser — PDF text
+// extraction doesn't preserve logical structure, only positions. That's
+// exactly why every result goes through human review before anything
+// changes in the real data.
+function parseHouseholdsFromLines(lines){
+  const phoneRe = /^\(\d{3}\)\s?\d{3}-\d{4}$/;
+  const zipLineRe = /^[A-Za-z.'\-\s]+,?\s+[A-Z]{2}\s+\d{5}(-\d{4})?$/;
+  const memberLineRe = /\b(male|female)\b\s*\d{0,3}\s*$/i;
+  const skipRe = /^(Name Household Members Gender Age|Member List|.*For Church Use Only.*|Count:\s*\d+.*|\d+\s*$)/i;
+
+  const records = [];
+  let i = 0;
+  while(i < lines.length){
+    const line = lines[i];
+    if(skipRe.test(line) || zipLineRe.test(line) || phoneRe.test(line) || memberLineRe.test(line)){
+      i++; continue;
+    }
+    if(line.includes(',') && line.length > 2){
+      const name = line.trim();
+      let phone = null;
+      const addressParts = [];
+      let j = i + 1;
+      if(j < lines.length && phoneRe.test(lines[j])){
+        phone = lines[j].trim();
+        j++;
+      }
+      let foundZip = false, guard = 0;
+      while(j < lines.length && guard < 6){
+        const l = lines[j];
+        if(zipLineRe.test(l)){ addressParts.push(l.trim()); j++; foundZip = true; break; }
+        if(memberLineRe.test(l) || phoneRe.test(l) || skipRe.test(l)) break;
+        addressParts.push(l.trim());
+        j++; guard++;
+      }
+      if(foundZip && addressParts.length){
+        records.push({ name, phone, address: addressParts.join(', ') });
+        i = j;
+        while(i < lines.length && (memberLineRe.test(lines[i]) || /^\d+\s*$/.test(lines[i]))) i++;
+        continue;
+      }
+    }
+    i++;
+  }
+  return records;
+}
+
+function normalizeForMatch(s){
+  return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+
+function computeRosterDiff(parsedList){
+  const currentByName = new Map();
+  households.forEach(h => currentByName.set(normalizeForMatch(h.household_name), h));
+  const parsedByName = new Map();
+  parsedList.forEach(p => parsedByName.set(normalizeForMatch(p.name), p));
+
+  const diffs = [];
+  currentByName.forEach((h, key) => {
+    const p = parsedByName.get(key);
+    if(p){
+      const phoneChanged = normalizeForMatch(p.phone) !== normalizeForMatch(h.phone);
+      const addressChanged = normalizeForMatch(p.address) !== normalizeForMatch(h.address);
+      if(phoneChanged || addressChanged){
+        diffs.push({
+          change_type: 'changed', household_id: h.id,
+          parsed_name: p.name, parsed_phone: p.phone, parsed_address: p.address,
+          old_name: h.household_name, old_phone: h.phone, old_address: h.address
+        });
+      }
+    } else {
+      diffs.push({ change_type: 'removed', household_id: h.id, old_name: h.household_name, old_phone: h.phone, old_address: h.address });
+    }
+  });
+  parsedByName.forEach((p, key) => {
+    if(!currentByName.has(key)){
+      diffs.push({ change_type: 'new', parsed_name: p.name, parsed_phone: p.phone, parsed_address: p.address });
+    }
+  });
+  return diffs;
+}
+
+async function runRosterImport(file){
+  const lines = await extractPdfLines(file);
+  const parsed = parseHouseholdsFromLines(lines);
+  if(parsed.length < 5){
+    throw new Error(`Only recognized ${parsed.length} household(s) in this file — that's suspiciously low for a full roster. Nothing was saved; double-check this is the right PDF, or the format may have changed.`);
+  }
+  const diffs = computeRosterDiff(parsed);
+
+  const { data: importRow, error: impErr } = await sb.from('roster_imports').insert({
+    imported_by: currentUser.id, source_filename: file.name, total_parsed: parsed.length,
+    matched_count: parsed.length - diffs.filter(d => d.change_type === 'new').length,
+    unmatched_count: diffs.filter(d => d.change_type === 'new').length
+  }).select().single();
+  if(impErr) throw impErr;
+
+  if(diffs.length){
+    const rows = diffs.map(d => ({ ...d, import_id: importRow.id }));
+    const { error: diffErr } = await sb.from('roster_diffs').insert(rows);
+    if(diffErr) throw diffErr;
+  }
+  return { parsedCount: parsed.length, diffCount: diffs.length };
+}
+
+let pendingDiffs = [];
+async function loadPendingDiffs(){
+  const { data, error } = await sb.from('roster_diffs').select('*').eq('status','pending').order('created_at');
+  if(error){ console.error(error); return; }
+  pendingDiffs = data || [];
+}
+
+/* ---------------- Map placement mode for newly-found households ---------------- */
+let placementDiff = null;
+function startPlacementMode(diff){
+  placementDiff = diff;
+  document.querySelector('.tab-btn[data-tab="map"]')?.click();
+  const existing = document.getElementById('placement-banner');
+  if(existing) existing.remove();
+  const banner = document.createElement('div');
+  banner.id = 'placement-banner';
+  banner.style.cssText = 'position:absolute;top:10px;left:50%;transform:translateX(-50%);background:#374A3E;color:#fff;padding:10px 18px;border-radius:10px;z-index:1000;font-size:14px;box-shadow:0 2px 10px rgba(0,0,0,0.25);display:flex;align-items:center;gap:10px;';
+  banner.innerHTML = `<span>Click the map to place <strong>${escapeHtml(diff.parsed_name)}</strong></span>`;
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.style.cssText = 'background:rgba(255,255,255,0.2);border:none;color:#fff;padding:4px 10px;border-radius:6px;cursor:pointer;';
+  cancelBtn.addEventListener('click', cancelPlacementMode);
+  banner.appendChild(cancelBtn);
+  document.getElementById('map').appendChild(banner);
+  if(map){ map.getContainer().style.cursor = 'crosshair'; map.once('click', onPlacementClick); }
+}
+function cancelPlacementMode(){
+  placementDiff = null;
+  document.getElementById('placement-banner')?.remove();
+  if(map){ map.getContainer().style.cursor = ''; map.off('click', onPlacementClick); }
+}
+async function onPlacementClick(e){
+  const diff = placementDiff;
+  if(!diff) return;
+  const { lat, lng } = e.latlng;
+  if(!confirm(`Place "${diff.parsed_name}" at this spot on the map?`)){ cancelPlacementMode(); return; }
+  const { error } = await sb.from('households').insert({
+    household_name: diff.parsed_name, phone: diff.parsed_phone,
+    address: diff.parsed_address || '(address not detected — edit this household to add it)',
+    lat, lng, active: true
+  });
+  if(error){ alert('Could not place household: ' + error.message); cancelPlacementMode(); return; }
+  await sb.from('roster_diffs').update({ status: 'accepted' }).eq('id', diff.id);
+  cancelPlacementMode();
+  await loadHouseholds();
+  await loadPendingDiffs();
+  renderCallingTab();
+}
+
 async function runZoneSplit(n){
   if(!confirm(`Split all ${households.length} households into ${n} zones? This replaces the current zone assignments.`)) return false;
   const points = households.map(h => ({ id: h.id, lat: h.lat, lng: h.lng }));
@@ -778,12 +969,16 @@ async function renderCallingTab(){
   const el = document.getElementById('calling-content');
   if(myProfile.role === 'wtfhl'){
     await loadInvites();
-    el.innerHTML = inviteSectionHTML() + peopleSectionHTML() + zoneAssignSectionHTML() + noContactViewOnlyHTML();
+    await loadPendingDiffs();
+    el.innerHTML = rosterUpdateSectionHTML() + inviteSectionHTML() + peopleSectionHTML() + zoneAssignSectionHTML() + noContactViewOnlyHTML();
+    wireRosterUpdateSection();
     wireInviteSection();
     wirePeopleSection();
     wireZoneAssignSection();
   } else if(myProfile.role === 'bishop'){
-    el.innerHTML = peopleSectionHTML() + zoneAssignSectionHTML() + noContactChecklistHTML();
+    await loadPendingDiffs();
+    el.innerHTML = rosterUpdateSectionHTML() + peopleSectionHTML() + zoneAssignSectionHTML() + noContactChecklistHTML();
+    wireRosterUpdateSection();
     wirePeopleSection();
     wireZoneAssignSection();
     wireNoContactChecklist();
@@ -794,6 +989,125 @@ async function renderCallingTab(){
   } else {
     el.innerHTML = '<p class="hint">Nothing to show here yet.</p>';
   }
+}
+
+/* ---- Roster update: upload PDF, review new/changed/removed households ---- */
+function rosterUpdateSectionHTML(){
+  const grouped = { new: [], removed: [], changed: [] };
+  pendingDiffs.forEach(d => grouped[d.change_type].push(d));
+
+  const newRows = grouped.new.map(d => `<div class="nc-row" data-diff="${d.id}">
+    <div class="who">
+      <strong>${escapeHtml(d.parsed_name)}</strong> <span style="color:var(--sage-dark);font-size:11.5px;font-weight:600;">NEW</span>
+      <div class="addr">${escapeHtml(d.parsed_address || '(no address found)')}${d.parsed_phone ? ' · ' + escapeHtml(d.parsed_phone) : ''}</div>
+    </div>
+    <div style="display:flex;gap:6px;flex-shrink:0;">
+      <button class="btn-secondary place-on-map-btn" data-diff="${d.id}">Place on map</button>
+      <button class="btn-secondary ignore-diff-btn" data-diff="${d.id}" style="background:#fff;color:var(--ink-soft);border:1.5px solid var(--line);">Ignore</button>
+    </div>
+  </div>`).join('');
+
+  const removedRows = grouped.removed.map(d => `<div class="nc-row" data-diff="${d.id}">
+    <div class="who">
+      <strong>${escapeHtml(d.old_name)}</strong> <span style="color:var(--brick);font-size:11.5px;font-weight:600;">NOT IN NEW LIST</span>
+      <div class="addr">${escapeHtml(d.old_address || '')}</div>
+    </div>
+    <div style="display:flex;gap:6px;flex-shrink:0;">
+      <button class="btn-secondary archive-diff-btn" data-diff="${d.id}" style="background:#fff;color:var(--brick);border:1.5px solid var(--brick);">Mark inactive</button>
+      <button class="btn-secondary keep-diff-btn" data-diff="${d.id}" style="background:#fff;color:var(--ink-soft);border:1.5px solid var(--line);">Keep as-is</button>
+    </div>
+  </div>`).join('');
+
+  const changedRows = grouped.changed.map(d => `<div class="nc-row" data-diff="${d.id}" style="flex-direction:column;align-items:stretch;">
+    <div class="who"><strong>${escapeHtml(d.old_name)}</strong> <span style="color:#8A5F1B;font-size:11.5px;font-weight:600;">CHANGED</span></div>
+    <div class="addr">Was: ${escapeHtml(d.old_phone || '(no phone)')} — ${escapeHtml(d.old_address || '')}</div>
+    <div class="addr">New: ${escapeHtml(d.parsed_phone || '(no phone)')} — ${escapeHtml(d.parsed_address || '')}</div>
+    <div style="display:flex;gap:6px;margin-top:8px;">
+      <button class="btn-secondary apply-diff-btn" data-diff="${d.id}">Use new info</button>
+      <button class="btn-secondary keep-diff-btn" data-diff="${d.id}" style="background:#fff;color:var(--ink-soft);border:1.5px solid var(--line);">Keep old info</button>
+    </div>
+  </div>`).join('');
+
+  return `<div class="calling-section" id="roster-update-section">
+    <h2>Update the roster</h2>
+    <p class="sub">Upload the latest ward PDF. Nothing changes automatically — every new, missing, or changed household shows up below for you to approve individually. PDF reading isn't perfect, so double-check anything that looks off before accepting it.</p>
+    <div class="split-row">
+      <input type="file" id="roster-pdf-input" accept="application/pdf" style="flex:1;">
+      <button class="btn-secondary" id="roster-upload-btn">Compare &amp; Review</button>
+    </div>
+    <div id="roster-upload-status" class="hint" style="margin-top:8px;"></div>
+    ${pendingDiffs.length ? `
+      <div style="margin-top:18px;">
+        ${grouped.new.length ? `<h3 style="font-size:14.5px;margin:14px 0 6px;">New households (${grouped.new.length})</h3>${newRows}` : ''}
+        ${grouped.changed.length ? `<h3 style="font-size:14.5px;margin:14px 0 6px;">Changed info (${grouped.changed.length})</h3>${changedRows}` : ''}
+        ${grouped.removed.length ? `<h3 style="font-size:14.5px;margin:14px 0 6px;">No longer listed (${grouped.removed.length})</h3>${removedRows}` : ''}
+      </div>` : '<p class="hint" style="margin-top:14px;">No pending roster changes to review.</p>'}
+  </div>`;
+}
+
+function wireRosterUpdateSection(){
+  document.getElementById('roster-upload-btn')?.addEventListener('click', async () => {
+    const input = document.getElementById('roster-pdf-input');
+    const file = input.files[0];
+    const status = document.getElementById('roster-upload-status');
+    if(!file){ status.textContent = 'Choose a PDF first.'; return; }
+    const btn = document.getElementById('roster-upload-btn');
+    btn.disabled = true; btn.textContent = 'Reading PDF…';
+    status.textContent = '';
+    try{
+      const result = await runRosterImport(file);
+      status.textContent = `Found ${result.parsedCount} households in the file — ${result.diffCount} difference(s) to review below.`;
+      await loadPendingDiffs();
+      renderCallingTab();
+    } catch(err){
+      status.textContent = 'Could not process this PDF: ' + err.message;
+    } finally {
+      btn.disabled = false; btn.textContent = 'Compare & Review';
+    }
+  });
+
+  document.querySelectorAll('.ignore-diff-btn, .keep-diff-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await sb.from('roster_diffs').update({ status: 'rejected' }).eq('id', btn.dataset.diff);
+      await loadPendingDiffs();
+      renderCallingTab();
+    });
+  });
+
+  document.querySelectorAll('.archive-diff-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const diff = pendingDiffs.find(d => d.id === btn.dataset.diff);
+      if(!diff) return;
+      if(!confirm(`Mark "${diff.old_name}" as inactive? They'll disappear from the map and every list, but their contact history is kept — this can be reversed later if it's a mistake.`)) return;
+      await sb.from('households').update({ active: false }).eq('id', diff.household_id);
+      await sb.from('roster_diffs').update({ status: 'accepted' }).eq('id', diff.id);
+      await loadPendingDiffs();
+      await loadHouseholds();
+      renderCallingTab();
+    });
+  });
+
+  document.querySelectorAll('.apply-diff-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const diff = pendingDiffs.find(d => d.id === btn.dataset.diff);
+      if(!diff) return;
+      const updates = {};
+      if(diff.parsed_phone) updates.phone = diff.parsed_phone;
+      if(diff.parsed_address) updates.address = diff.parsed_address;
+      await sb.from('households').update(updates).eq('id', diff.household_id);
+      await sb.from('roster_diffs').update({ status: 'accepted' }).eq('id', diff.id);
+      await loadPendingDiffs();
+      await loadHouseholds();
+      renderCallingTab();
+    });
+  });
+
+  document.querySelectorAll('.place-on-map-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const diff = pendingDiffs.find(d => d.id === btn.dataset.diff);
+      if(diff) startPlacementMode(diff);
+    });
+  });
 }
 
 /* ---- Invite people (WTFHL only) ---- */
